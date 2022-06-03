@@ -1,0 +1,15 @@
+venv/
+build/
+*.charm
+
+.coverage
+__pycache__/
+*.py[cod]
+
+.vscode
+bin/
+lib64
+pyvenv.cfg
+share/
+.idea/
+.tox/
