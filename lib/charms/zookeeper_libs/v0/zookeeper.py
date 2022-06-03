@@ -41,14 +41,14 @@ class ZooKeeperConfiguration:
 
     @property
     def uri(self) -> str:
-        """Return URI concatenated from fields."""
+        """Return URI concatenated from hosts."""
         uri = ""
         for host in self.hosts:
             uri += self.parse_host_port(host) + ","
         return uri[:-1]
 
     @property
-    def leader(self) -> Optional[str]:
+    def quorum_leader(self) -> Optional[str]:
         """Connect to all members and find the leader."""
         votes = defaultdict(int)
         for member in self.hosts:
@@ -68,7 +68,7 @@ class ZooKeeperConfiguration:
 
     @staticmethod
     def parse_host_port(member: Optional[str]) -> Optional[str]:
-        """Parse hostport from ZooKeeper member entry."""
+        """Parse hostport from ZooKeeper config entry."""
         if member and "=" in member and ":" in member:
             return member.split("=")[1].split(":")[0] + ":" + member.split(":")[-1]
         return member
@@ -85,12 +85,12 @@ class ZooKeeperConnection:
     Connection is automatically closed when object destroyed.
     Automatic close allows to have more clean code.
 
-    Note that connection when used may lead to the following kazoo errors: KazooTimeoutError,
-    NoNodeError, ZookeeperError. It is suggested that the following pattern be adopted
-    when using ZooKeeperConnection:
+    Note that connection when used may lead to the multiple different kazoo exceptions.
+    Please carefully check list of possible exceptions in doc string of each method.
+    It is suggested that the following pattern be adopted when using ZooKeeperConnection:
 
     try:
-        with ZooKeeperConnection(self._zk_config) as zk:
+        with ZooKeeperConnection(self._zookeeper_config) as zk:
             zk.<some operation from this class>
     except (KazooTimeoutError, NoNodeError, ZookeeperError) as e:
         <error handling as needed>
@@ -99,13 +99,13 @@ class ZooKeeperConnection:
     def __init__(self, config: ZooKeeperConfiguration, uri=None):
         """A ZooKeeper client interface.
 
-        Args:
-            — config: MongoDB Configuration object.
+        Raises:
+            KazooTimeoutError
         """
         self.config = config
 
         if uri == "leader":
-            uri = config.leader
+            uri = config.quorum_leader
             logger.debug("Connection to leader: %s", uri)
 
         if uri is None:
@@ -140,6 +140,9 @@ class ZooKeeperConnection:
         Returns:
             True if services is ready False otherwise. Retries over a period of 60 seconds times to
             allow server time to start up.
+
+        Raises:
+            ConnectionLoss
         """
         if self.client.connected:
             mntr = self._run_command("mntr")
@@ -147,10 +150,11 @@ class ZooKeeperConnection:
         return False
 
     def get_members(self) -> (Set[str], int):
-        """Get a members.
+        """Get a members configured inside ZooKeeper.
 
         Returns:
             A set of the members as reported by ZooKeeper.
+            A configuration version applied.
 
         Raises:
             NoNodeError, ZookeeperError
@@ -164,7 +168,10 @@ class ZooKeeperConnection:
         """Add a new member to config inside ZooKeeper.
 
         Raises:
-            ConnectionLoss, NewConfigNoQuorumError ReconfigInProcessError BadVersionError ZookeeperError
+            NoNodeError, ZookeeperError — from `get_members`.
+            ConnectionLoss — from `_is_any_sync`.
+            UnimplementedError, NewConfigNoQuorumError, ReconfigInProcessError,
+            BadVersionError, BadArgumentsError, ZookeeperError — from `reconfig`.
         """
         _, version = self.get_members()
 
@@ -183,7 +190,10 @@ class ZooKeeperConnection:
         """Remove member from the config inside ZooKeeper.
 
         Raises:
-            ConfigurationError, ConfigurationError, OperationFailure, NotReadyError
+            NoNodeError, ZookeeperError — from `get_members`.
+            ConnectionLoss — from `_is_any_sync`.
+            UnimplementedError, NewConfigNoQuorumError, ReconfigInProcessError,
+            BadVersionError, BadArgumentsError, ZookeeperError — from `reconfig`.
         """
         _, version = self.get_members()
         member_id = member.split(".")[1].split("=")[0]
@@ -200,8 +210,11 @@ class ZooKeeperConnection:
     def _is_any_sync(self) -> bool:
         """Returns true if any members are syncing data.
 
-        Checks if any members are syncing data. Note it is recommended to run only
-        one sync in the cluster to not have huge performance degradation.
+        Checks if any members are syncing data. Note it is recommended to run
+        only one sync in the cluster to avoid forming quorum by new members.
+
+        Raises:
+            ConnectionLoss
         """
         state = self._run_command("mntr")
         if state["zk_peer_state"] == "leading - broadcast" and state["zk_pending_syncs"] == "0":
@@ -209,6 +222,11 @@ class ZooKeeperConnection:
         return True
 
     def _run_command(self, command: str) -> Dict:
+        """Run and parse any ZooKeeper command.
+
+        Raises:
+            ConnectionLoss
+        """
         zk_response = self.client.command(command.encode())
         return dict(
             (element.split("\t", 2)[0], element.split("\t", 2)[1])

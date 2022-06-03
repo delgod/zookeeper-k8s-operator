@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 def get_zookeeper_cmd() -> str:
-    """Construct the MongoDB startup command line.
+    """Construct the ZooKeeper startup command line.
 
     Returns:
         A string representing the command used to start MongoDB.
@@ -80,22 +80,22 @@ def get_main_config(myid: int) -> str:
     """
 
 
-def get_auth_config(password: str) -> str:
+def get_auth_config(sync_password, super_password: str) -> str:
     """Generate content of the auth ZooKeeper config file"""
     return f"""
         Server {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
-            user_super="{password}";
+            user_super="{super_password}";
         }};
 
         QuorumServer {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
-            user_cluster="{password}";
+            user_cluster="{sync_password}";
         }};
 
         QuorumLearner {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
             username="cluster"
-            password="{password}";
+            password="{sync_password}";
         }};
     """

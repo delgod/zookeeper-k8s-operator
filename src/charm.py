@@ -28,7 +28,16 @@ from charms.zookeeper_libs.v0.zookeeper import (
     ZooKeeperConfiguration,
     ZooKeeperConnection,
 )
-from kazoo.exceptions import NoNodeError, ZookeeperError
+from kazoo.exceptions import (
+    BadArgumentsError,
+    BadVersionError,
+    ConnectionLoss,
+    NewConfigNoQuorumError,
+    NoNodeError,
+    ReconfigInProcessError,
+    UnimplementedError,
+    ZookeeperError,
+)
 from kazoo.handlers.threading import KazooTimeoutError
 from ops.charm import CharmBase
 from ops.main import main
@@ -53,18 +62,24 @@ class ZooKeeperCharm(CharmBase):
         self.framework.observe(self.on[PEER].relation_changed, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_departed, self._reconfigure)
 
-    def _on_peer_relation_joined(self, event) -> None:
+    def _on_peer_relation_joined(self, _) -> None:
+        """A ZooKeeper needs to know about peers during start.
+
+        We do not start pebble layer before information about peers available in peer relation.
+        """
         self._peer_relation_joined = True
 
     def _on_zookeeper_pebble_ready(self, event) -> None:
         """Configure pebble layer specification."""
-        # Wait for super password, it is needed for configs
-        if "super_password" not in self.app_data:
+        # Wait for the password used for synchronisation between members.
+        # It should be generated once and be the same on all members.
+        if "sync_password" not in self.app_data:
             logger.error("Super password is not ready yet.")
             event.defer()
             return
 
-        # Wait for peer relation joined event
+        # ZooKeeper needs to know about peers during start.
+        # We do not start pebble layer before information about peers available in peer relation.
         if self._peer_relation_joined:
             logger.error("Peer relation is not joined yet.")
             event.defer()
@@ -95,10 +110,12 @@ class ZooKeeperCharm(CharmBase):
     def _generate_passwords(self) -> None:
         """Generate passwords and put them into peer relation.
 
-        The same super password on all members needed.
+        The same sync and super passwords on all members needed.
         It means, it is needed to generate them once and share between members.
         NB: only leader should execute this function.
         """
+        if "sync_password" not in self.app_data:
+            self.app_data["sync_password"] = generate_password()
         if "super_password" not in self.app_data:
             self.app_data["super_password"] = generate_password()
 
@@ -107,14 +124,6 @@ class ZooKeeperCharm(CharmBase):
 
         The amount members is updated.
         """
-        # update members in config file
-        # container = self.unit.get_container("zookeeper")
-        # if not container.can_connect():
-        #     logger.debug("zookeeper container is not ready yet.")
-        #     event.defer()
-        #     return
-        # self._put_dynamic_configs(container)
-
         if not self.unit.is_leader():
             return
         self.app_data["juju_leader"] = self.unit.name
@@ -123,9 +132,6 @@ class ZooKeeperCharm(CharmBase):
         try:
             with ZooKeeperConnection(self._zookeeper_config, "leader") as zk:
                 zookeeper_members, _ = zk.get_members()
-
-                logger.debug("znode_members: %r", zookeeper_members)
-                logger.debug("peer_members: %r", self._zookeeper_config.hosts)
 
                 # compare set of zookeeper members and juju hosts
                 # to avoid the unnecessary reconfiguration.
@@ -144,7 +150,17 @@ class ZooKeeperCharm(CharmBase):
                             event.defer()
                     logger.debug("Adding %s", member)
                     zk.add_member(member)
-        except (KazooTimeoutError, NoNodeError, ZookeeperError) as e:
+        except (
+            KazooTimeoutError,
+            NoNodeError,
+            ZookeeperError,
+            ConnectionLoss,
+            UnimplementedError,
+            NewConfigNoQuorumError,
+            ReconfigInProcessError,
+            BadVersionError,
+            BadArgumentsError,
+        ) as e:
             logger.info("Deferring reconfigure: error=%r", e)
             event.defer()
 
@@ -208,15 +224,19 @@ class ZooKeeperCharm(CharmBase):
         )
         container.push(
             AUTH_CONFIG_PATH,
-            get_auth_config(self.app_data.get("super_password")),
+            get_auth_config(self.app_data.get("sync_password"), self.app_data.get("super_password")),
             make_dirs=True,
             permissions=0o400,
             user="zookeeper",
             group="zookeeper",
         )
-        members = self._get_init_units
-        if self._zookeeper_config.leader is not None:
-            members = self._get_peer_units
+
+        members = self._get_peer_units
+        # If no quorum, unit should join as observer. It is needed for
+        # avoiding situations when new members (without data) form a quorum.
+        if self._zookeeper_config.quorum_leader is None:
+            members = self._get_init_units
+
         container.push(
             DYN_CONFIG_PATH,
             "\n".join(members),
@@ -226,16 +246,12 @@ class ZooKeeperCharm(CharmBase):
             group="zookeeper",
         )
 
-    def _put_dynamic_configs(self, container: Container) -> None:
-        """Upload the configs to a workload container."""
-        container.push(
-            DYN_CONFIG_PATH,
-            "\n".join(self._get_peer_units),
-            make_dirs=True,
-            permissions=0o400,
-            user="zookeeper",
-            group="zookeeper",
-        )
+    @property
+    def _get_peer_units(self) -> List:
+        result = []
+        for unit in [self.unit] + list(self.model.get_relation(PEER).units):
+            result.append(self._get_server_str(unit.name))
+        return result
 
     @property
     def _get_init_units(self) -> List:
@@ -249,15 +265,13 @@ class ZooKeeperCharm(CharmBase):
         unit_hostname = self._get_hostname_by_unit(unit_name)
         return f"server.{unit_id}={unit_hostname}:2888:3888:{role};0.0.0.0:2181"
 
-    @property
-    def _get_peer_units(self) -> List:
-        result = []
-        for unit in [self.unit] + list(self.model.get_relation(PEER).units):
-            result.append(self._get_server_str(unit.name))
-        return result
-
     @staticmethod
     def _get_unit_id_by_unit(unit_name: str) -> int:
+        """Cut number from the unit name.
+
+        The ID value “0” creates issues with ZooKeeper, it is needed to use >0 IDs.
+        To avoid issues with ZooKeeper we increase the unit ID by ten.
+        """
         return int(unit_name.split("/")[1]) + 10
 
     def _get_hostname_by_unit(self, unit_name: str) -> str:
