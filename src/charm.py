@@ -71,6 +71,13 @@ class ZooKeeperCharm(CharmBase):
 
     def _on_zookeeper_pebble_ready(self, event) -> None:
         """Configure pebble layer specification."""
+        # ZooKeeper needs to know about peers during start.
+        # We do not start pebble layer before information about peers available in peer relation.
+        if self._peer_relation_joined:
+            logger.error("Peer relation is not joined yet.")
+            event.defer()
+            return
+
         # Wait for the password used for synchronisation between members.
         # It should be generated once and be the same on all members.
         if "sync_password" not in self.app_data:
@@ -78,10 +85,8 @@ class ZooKeeperCharm(CharmBase):
             event.defer()
             return
 
-        # ZooKeeper needs to know about peers during start.
-        # We do not start pebble layer before information about peers available in peer relation.
-        if self._peer_relation_joined:
-            logger.error("Peer relation is not joined yet.")
+        if not self._is_my_turn:
+            logger.error("The first time ZooKeeper members should start sequentially.")
             event.defer()
             return
 
@@ -126,7 +131,6 @@ class ZooKeeperCharm(CharmBase):
         """
         if not self.unit.is_leader():
             return
-        self.app_data["juju_leader"] = self.unit.name
         self._generate_passwords()
 
         try:
@@ -150,6 +154,7 @@ class ZooKeeperCharm(CharmBase):
                             event.defer()
                     logger.debug("Adding %s", member)
                     zk.add_member(member)
+                    self.app_data[member.split("=")[0]] = "started"
         except (
             KazooTimeoutError,
             NoNodeError,
@@ -216,7 +221,7 @@ class ZooKeeperCharm(CharmBase):
         )
         container.push(
             CONFIG_PATH,
-            get_main_config(myid),
+            get_main_config(),
             make_dirs=True,
             permissions=0o400,
             user="zookeeper",
@@ -224,7 +229,9 @@ class ZooKeeperCharm(CharmBase):
         )
         container.push(
             AUTH_CONFIG_PATH,
-            get_auth_config(self.app_data.get("sync_password"), self.app_data.get("super_password")),
+            get_auth_config(
+                self.app_data.get("sync_password"), self.app_data.get("super_password")
+            ),
             make_dirs=True,
             permissions=0o400,
             user="zookeeper",
@@ -232,9 +239,9 @@ class ZooKeeperCharm(CharmBase):
         )
 
         members = self._get_peer_units
-        # If no quorum, unit should join as observer. It is needed for
-        # avoiding situations when new members (without data) form a quorum.
-        if self._zookeeper_config.quorum_leader is None:
+        # To avoid split-brain situations.
+        # On just created the new/fresh cluster, new units should join as the “observer”.
+        if not self._is_init_finished:
             members = self._get_init_units
 
         container.push(
@@ -247,6 +254,35 @@ class ZooKeeperCharm(CharmBase):
         )
 
     @property
+    def _is_my_turn(self) -> bool:
+        myid = self._get_unit_id_by_unit(self.unit.name)
+        for unit_id in range(1, myid):
+            if self._get_unit_status(unit_id) != "started":
+                return False
+        return True
+
+    @property
+    def _is_init_finished(self) -> bool:
+        myid = self._get_unit_id_by_unit(self.unit.name)
+        for unit in list(self.model.get_relation(PEER).units):
+            unit_id = self._get_unit_id_by_unit(unit.name)
+            if myid < unit_id:
+                continue
+            logger.debug("%s status: %s", unit.name, unit.status)
+
+        myid = self._get_unit_id_by_unit(self.unit.name)
+        for unit_id in range(1, myid + 1):
+            if self._get_unit_status(unit_id) != "started":
+                return False
+        return True
+
+    def _get_unit_status(self, unit_id: int) -> str:
+        server_str = f"server.{unit_id}"
+        if server_str not in self.app_data:
+            return "unknown"
+        return self.app_data[server_str]
+
+    @property
     def _get_peer_units(self) -> List:
         result = []
         for unit in [self.unit] + list(self.model.get_relation(PEER).units):
@@ -255,8 +291,9 @@ class ZooKeeperCharm(CharmBase):
 
     @property
     def _get_init_units(self) -> List:
-        result = [self._get_server_str(self.app_data["juju_leader"])]
-        if self.unit.name != self.app_data["juju_leader"]:
+        quorum_leader = self.unit.name.split("/")[0] + "/0"
+        result = [self._get_server_str(quorum_leader)]
+        if self.unit.name != quorum_leader:
             result.append(self._get_server_str(self.unit.name, "observer"))
         return result
 
@@ -267,12 +304,8 @@ class ZooKeeperCharm(CharmBase):
 
     @staticmethod
     def _get_unit_id_by_unit(unit_name: str) -> int:
-        """Cut number from the unit name.
-
-        The ID value “0” creates issues with ZooKeeper, it is needed to use >0 IDs.
-        To avoid issues with ZooKeeper we increase the unit ID by ten.
-        """
-        return int(unit_name.split("/")[1]) + 10
+        """Cut number from the unit name."""
+        return int(unit_name.split("/")[1])
 
     def _get_hostname_by_unit(self, unit_name: str) -> str:
         """Create a DNS name for a unit.
@@ -283,7 +316,7 @@ class ZooKeeperCharm(CharmBase):
         Returns:
             A string representing the hostname of the unit.
         """
-        unit_id = unit_name.split("/")[1]
+        unit_id = self._get_unit_id_by_unit(unit_name)
         return f"{self.app.name}-{unit_id}.{self.app.name}-endpoints"
 
 

@@ -32,8 +32,17 @@ def get_zookeeper_cmd() -> str:
     """
     cmd = [
         "/usr/local/openjdk-11/bin/java",
-        "-cp '/apache-zookeeper-3.8.0-bin/lib/*:/conf'",
-        # f"-Djava.security.auth.login.config={AUTH_CONFIG_PATH}",
+        "-cp '/apache-zookeeper-3.8.0-bin/lib/*:/conf:'",
+        "-Xmx1000m",
+        "-XX:+HeapDumpOnOutOfMemoryError",
+        "-XX:OnOutOfMemoryError='kill -9 %p'",
+        "-Dcom.sun.management.jmxremote",
+        "-Dcom.sun.management.jmxremote.local.only=true",
+        "-Dzookeeper.log.dir=/var/log",
+        "-Dzookeeper.log.file=zookeeper.log",
+        "-Dzookeeper.requireClientAuthScheme=sasl",
+        "-Dzookeeper.superUser.1=super",
+        f"-Djava.security.auth.login.config={AUTH_CONFIG_PATH}",
         "org.apache.zookeeper.server.quorum.QuorumPeerMain",
         CONFIG_PATH,
     ]
@@ -50,33 +59,23 @@ def generate_password() -> str:
     return "".join([secrets.choice(choices) for _ in range(32)])
 
 
-def get_main_config(myid: int) -> str:
+def get_main_config() -> str:
     """Generate content of the main ZooKeeper config file"""
     return f"""
-        dataDir={DATA_DIR}
-        reconfigEnabled=true
         standaloneEnabled=false
+        dataDir={DATA_DIR}
         4lw.commands.whitelist=*
-        quorumListenOnAllIPs=true
         tickTime=1000
         initLimit=30
+        quorumListenOnAllIPs=true
         syncLimit=3
+        reconfigEnabled=true
         dynamicConfigFile={DYN_CONFIG_PATH}
-        
-        # DigestAuthenticationProvider.enabled=false
-        # requireClientAuthScheme=sasl
-        # enforce.auth.enabled=true
-        # enforce.auth.schemes=sasl
-        # authProvider.{myid}=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
-        # zookeeper.superUser=super
-        skipACL=yes
-        
-        # quorum.auth.enableSasl=true
-        # quorum.auth.learnerRequireSasl=true
-        # quorum.auth.serverRequireSasl=true
-        # quorum.auth.learner.saslLoginContext=QuorumLearner
-        # quorum.auth.server.saslLoginContext=QuorumServer
-        # quorum.cnxn.threads.size=20
+
+        quorum.auth.enableSasl=true
+        quorum.auth.learnerRequireSasl=true
+        quorum.auth.serverRequireSasl=true
+        quorum.cnxn.threads.size=20
     """
 
 
@@ -86,6 +85,12 @@ def get_auth_config(sync_password, super_password: str) -> str:
         Server {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
             user_super="{super_password}";
+        }};
+
+        Client {{
+            org.apache.zookeeper.server.auth.DigestLoginModule required
+            username="super"
+            password="{super_password}";
         }};
 
         QuorumServer {{

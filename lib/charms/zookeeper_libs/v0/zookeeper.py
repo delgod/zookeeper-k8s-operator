@@ -117,11 +117,11 @@ class ZooKeeperConnection:
         self.client = KazooClient(
                 hosts=uri,
                 read_only=False,
-                # sasl_options={
-                #     'mechanism': 'DIGEST-MD5',
-                #     'username': config.username,
-                #     'password': config.password,
-                # },
+                sasl_options={
+                    'mechanism': 'DIGEST-MD5',
+                    'username': config.username,
+                    'password': config.password,
+                },
         )
         self.client.start()
 
