@@ -53,31 +53,13 @@ class ZooKeeperCharm(CharmBase):
 
     def __init__(self, *args):
         super().__init__(*args)
-        self._peer_relation_joined = False
-
         self.framework.observe(self.on.zookeeper_pebble_ready, self._on_zookeeper_pebble_ready)
-        self.framework.observe(self.on[PEER].relation_joined, self._on_peer_relation_joined)
-
         self.framework.observe(self.on.leader_elected, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_changed, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_departed, self._reconfigure)
 
-    def _on_peer_relation_joined(self, _) -> None:
-        """A ZooKeeper needs to know about peers during start.
-
-        We do not start pebble layer before information about peers available in peer relation.
-        """
-        self._peer_relation_joined = True
-
     def _on_zookeeper_pebble_ready(self, event) -> None:
         """Configure pebble layer specification."""
-        # ZooKeeper needs to know about peers during start.
-        # We do not start pebble layer before information about peers available in peer relation.
-        if self._peer_relation_joined:
-            logger.error("Peer relation is not joined yet.")
-            event.defer()
-            return
-
         # Wait for the password used for synchronisation between members.
         # It should be generated once and be the same on all members.
         if "sync_password" not in self.app_data:
@@ -119,10 +101,10 @@ class ZooKeeperCharm(CharmBase):
         It means, it is needed to generate them once and share between members.
         NB: only leader should execute this function.
         """
-        if "sync_password" not in self.app_data:
-            self.app_data["sync_password"] = generate_password()
         if "super_password" not in self.app_data:
             self.app_data["super_password"] = generate_password()
+        if "sync_password" not in self.app_data:
+            self.app_data["sync_password"] = generate_password()
 
     def _reconfigure(self, event) -> None:
         """Reconfigure members.
@@ -131,23 +113,30 @@ class ZooKeeperCharm(CharmBase):
         """
         if not self.unit.is_leader():
             return
+
+        # We generate passwords here, because “on_leader_elected“
+        # runs earlier than _on_zookeeper_pebble_ready event.
         self._generate_passwords()
 
         try:
             with ZooKeeperConnection(self._zookeeper_config, "leader") as zk:
                 zookeeper_members, _ = zk.get_members()
 
-                # compare set of zookeeper members and juju hosts
+                # compare (sets) members from /zookeeper/config and juju peer list
                 # to avoid the unnecessary reconfiguration.
                 if zookeeper_members == self._zookeeper_config.hosts:
                     return
 
-                # remove members first, it is faster
+                # remove members first, it is faster (no startup/initial sync delay)
                 logger.info("Reconfigure zookeeper members")
                 for member in zookeeper_members - self._zookeeper_config.hosts:
                     logger.debug("Removing %s", member)
                     zk.remove_member(member)
-                for member in self._zookeeper_config.hosts - zookeeper_members:
+                    self.app_data[member.split("=")[0]] = "removed"
+
+                # It is impossible to add a member with ID lower than the biggest ID between current members.
+                # Use “sorted” function to avoid issues.
+                for member in sorted(self._zookeeper_config.hosts - zookeeper_members):
                     with ZooKeeperConnection(self._zookeeper_config, member) as direct_conn:
                         if not direct_conn.is_ready:
                             logger.info("Deferring reconfigure: %s not ready", member)
@@ -239,8 +228,8 @@ class ZooKeeperCharm(CharmBase):
         )
 
         members = self._get_peer_units
-        # To avoid split-brain situations.
-        # On just created the new/fresh cluster, new units should join as the “observer”.
+        # On just created the new/fresh cluster, new units should join as the “observer” before initial sync.
+        # Especially case when unit/0 adds unit/1 it is not clear for ZooKeeper, which member has the latest data.
         if not self._is_init_finished:
             members = self._get_init_units
 
@@ -255,6 +244,11 @@ class ZooKeeperCharm(CharmBase):
 
     @property
     def _is_my_turn(self) -> bool:
+        """Function guarantee start units started in order unit/0->unit/1->unit/2.
+
+        Unfortunately, if ZooKeeper Server-Server auth configured, during the first
+        cluster start (and horizontal scaling) it is needed to add members in order.
+        """
         myid = self._get_unit_id_by_unit(self.unit.name)
         for unit_id in range(1, myid):
             if self._get_unit_status(unit_id) != "started":
@@ -263,6 +257,11 @@ class ZooKeeperCharm(CharmBase):
 
     @property
     def _is_init_finished(self) -> bool:
+        """Function detect the unit restart.
+
+        During initial start we should add members one by one, but during a single
+        unit restart or failure, we should put all members into the config.
+        """
         myid = self._get_unit_id_by_unit(self.unit.name)
         for unit in list(self.model.get_relation(PEER).units):
             unit_id = self._get_unit_id_by_unit(unit.name)
@@ -284,6 +283,7 @@ class ZooKeeperCharm(CharmBase):
 
     @property
     def _get_peer_units(self) -> List:
+        """Prepare ZooKeeper config with all cluster members."""
         result = []
         for unit in [self.unit] + list(self.model.get_relation(PEER).units):
             result.append(self._get_server_str(unit.name))
@@ -291,6 +291,11 @@ class ZooKeeperCharm(CharmBase):
 
     @property
     def _get_init_units(self) -> List:
+        """Prepare *initial* ZooKeeper config with some members.
+
+        On just created the new/fresh cluster, new units should join as the “observer” before initial sync.
+        Especially case when unit/0 adds unit/1 it is not clear for ZooKeeper, which member has the latest data.
+        """
         quorum_leader = self.unit.name.split("/")[0] + "/0"
         result = [self._get_server_str(quorum_leader)]
         if self.unit.name != quorum_leader:
@@ -298,6 +303,7 @@ class ZooKeeperCharm(CharmBase):
         return result
 
     def _get_server_str(self, unit_name: str, role="participant") -> str:
+        """Prepare member line for ZooKeeper config."""
         unit_id = self._get_unit_id_by_unit(unit_name)
         unit_hostname = self._get_hostname_by_unit(unit_name)
         return f"server.{unit_id}={unit_hostname}:2888:3888:{role};0.0.0.0:2181"

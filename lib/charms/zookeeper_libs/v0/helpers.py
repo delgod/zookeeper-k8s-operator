@@ -64,18 +64,18 @@ def get_main_config() -> str:
     return f"""
         standaloneEnabled=false
         dataDir={DATA_DIR}
-        4lw.commands.whitelist=*
+        4lw.commands.whitelist=mntr
         tickTime=1000
         initLimit=30
         quorumListenOnAllIPs=true
         syncLimit=3
         reconfigEnabled=true
         dynamicConfigFile={DYN_CONFIG_PATH}
+        DigestAuthenticationProvider.digestAlg=SHA3-256
 
         quorum.auth.enableSasl=true
         quorum.auth.learnerRequireSasl=true
         quorum.auth.serverRequireSasl=true
-        quorum.cnxn.threads.size=20
     """
 
 
