@@ -26,7 +26,7 @@ resources:
   zookeeper-image:
     type: oci-image
     description: OCI image for ZooKeeper K8s
-    upstream-source: zookeeper:3.8.0
+    upstream-source: zookeeper:3.6.3
 storage:
   db:
     type: filesystem

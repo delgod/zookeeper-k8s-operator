@@ -35,35 +35,53 @@ class ZooKeeperConfiguration:
     — hosts: full list of hosts to connect to, needed for the URI.
     """
 
+    chroot: Optional[str]
     username: str
-    password: str
+    password: Optional[str]
     hosts: Set[str]
+    roles: Set[str]
+
+    def __hash__(self):
+        return hash(f"{self.username}:{self.password}@{self.uri}")
 
     @property
     def uri(self) -> str:
         """Return URI concatenated from hosts."""
-        uri = ""
-        for host in self.hosts:
-            uri += self.parse_host_port(host) + ","
-        return uri[:-1]
+        uri = ",".join([
+            self.parse_host_port(host)
+            for host in sorted(self.hosts)
+        ])
+        return uri + self.chroot
 
     @property
     def quorum_leader(self) -> Optional[str]:
         """Connect to all members and find the leader."""
         votes = defaultdict(int)
         for member in self.hosts:
-            host = self.parse_host_port(member).split(":")[0]
-            try:
-                with urlopen(f"http://{host}:8080/commands/leader") as response:
-                    body = response.read()
-                    answer = json.loads(body)
-                    if "leader_ip" in answer:
-                        votes[answer["leader_ip"]] += 1
-            except (URLError, json.JSONDecodeError):
-                pass
+            leader = self.fetch_leader(member)
+            if leader is not None:
+                votes[leader] += 1
+            logger.debug("leader voting %s: %s", member, leader)
         for leader in votes:
             if votes[leader] > len(self.hosts) / 2:
                 return leader
+        return None
+
+    def fetch_leader(self, member_str: str) -> Optional[str]:
+        """Make http call to detect, which host is a leader for this particular member.
+
+        It looks ugly, a better approach was not found how to detect leader
+        in situation when two members think that they are the leader.
+        """
+        host = self.parse_host_port(member_str).split(":")[0]
+        try:
+            with urlopen(f"http://{host}:8080/commands/leader") as response:
+                body = response.read()
+                answer = json.loads(body)
+                if "leader_ip" in answer:
+                    return answer["leader_ip"]
+        except (URLError, FileNotFoundError, ConnectionResetError, json.JSONDecodeError):
+            pass
         return None
 
     @staticmethod
@@ -71,11 +89,17 @@ class ZooKeeperConfiguration:
         """Parse hostport from ZooKeeper config entry."""
         if member and "=" in member and ":" in member:
             return member.split("=")[1].split(":")[0] + ":" + member.split(":")[-1]
+        elif ":" not in member:
+            return member + ":2181"
         return member
 
 
 class NotReadyError(KazooException):
     """Raised when not all members healthy or finished initial sync."""
+
+
+class NotLeaderError(KazooException):
+    """Raised when connection to ZooKeeper Leader needed."""
 
 
 class ZooKeeperConnection:
@@ -96,7 +120,7 @@ class ZooKeeperConnection:
         <error handling as needed>
     """
 
-    def __init__(self, config: ZooKeeperConfiguration, uri=None):
+    def __init__(self, config: ZooKeeperConfiguration, uri=None) -> None:
         """A ZooKeeper client interface.
 
         Raises:
@@ -105,13 +129,15 @@ class ZooKeeperConnection:
         self.config = config
 
         if uri == "leader":
-            uri = config.quorum_leader
-            logger.debug("Connection to leader: %s", uri)
+            uri = self.config.quorum_leader
 
         if uri is None:
-            uri = config.uri
+            uri = self.config.uri
         elif "=" in uri:
             uri = self.config.parse_host_port(uri)
+
+        logger.debug("Config hosts: %r", self.config.hosts)
+        logger.debug("Connection to %s", uri)
 
         # auth_str = "%s:%s" % (config.username, config.password)
         self.client = KazooClient(
@@ -130,6 +156,7 @@ class ZooKeeperConnection:
 
     def __exit__(self, object_type, value, traceback):
         self.client.stop()
+        self.client.close()
         self.client = None
         self.config = None
 
@@ -217,11 +244,15 @@ class ZooKeeperConnection:
             ConnectionLoss
         """
         state = self._run_command("mntr")
+        logger.debug("zk_peer_state: %s", state["zk_peer_state"])
+        if "zk_pending_syncs" not in state:
+            raise NotLeaderError
+        logger.debug("zk_pending_syncs: %s", state["zk_pending_syncs"])
         if state["zk_peer_state"] == "leading - broadcast" and state["zk_pending_syncs"] == "0":
             return False
         return True
 
-    def _run_command(self, command: str) -> Dict:
+    def _run_command(self, command: str) -> Dict[str, str]:
         """Run and parse any ZooKeeper command.
 
         Raises:

@@ -12,19 +12,24 @@ includes scaling and other capabilities.
 """
 
 import logging
-from typing import Dict, List
+from typing import Dict, Set
 
 from charms.zookeeper_libs.v0.helpers import (
     AUTH_CONFIG_PATH,
     CONFIG_PATH,
     DATA_DIR,
     DYN_CONFIG_PATH,
+    GROUP,
+    LOGS_DIR,
+    USER,
     generate_password,
     get_auth_config,
     get_main_config,
     get_zookeeper_cmd,
 )
 from charms.zookeeper_libs.v0.zookeeper import (
+    NotLeaderError,
+    NotReadyError,
     ZooKeeperConfiguration,
     ZooKeeperConnection,
 )
@@ -39,10 +44,11 @@ from kazoo.exceptions import (
     ZookeeperError,
 )
 from kazoo.handlers.threading import KazooTimeoutError
-from ops.charm import CharmBase
+from ops.charm import CharmBase, HookEvent, PebbleReadyEvent
 from ops.main import main
-from ops.model import ActiveStatus, Container
+from ops.model import ActiveStatus
 from ops.pebble import Layer, PathError, ProtocolError
+from tenacity import RetryError, Retrying, stop_after_delay, wait_fixed
 
 logger = logging.getLogger(__name__)
 PEER = "database-peers"
@@ -51,14 +57,14 @@ PEER = "database-peers"
 class ZooKeeperCharm(CharmBase):
     """A Juju Charm to deploy ZooKeeper on Kubernetes."""
 
-    def __init__(self, *args):
+    def __init__(self, *args) -> None:
         super().__init__(*args)
         self.framework.observe(self.on.zookeeper_pebble_ready, self._on_zookeeper_pebble_ready)
         self.framework.observe(self.on.leader_elected, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_changed, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_departed, self._reconfigure)
 
-    def _on_zookeeper_pebble_ready(self, event) -> None:
+    def _on_zookeeper_pebble_ready(self, event: PebbleReadyEvent) -> None:
         """Configure pebble layer specification."""
         # Wait for the password used for synchronisation between members.
         # It should be generated once and be the same on all members.
@@ -67,23 +73,9 @@ class ZooKeeperCharm(CharmBase):
             event.defer()
             return
 
-        if not self._is_my_turn:
-            logger.error("The first time ZooKeeper members should start sequentially.")
-            event.defer()
-            return
-
         # Prepare configs
-        container = self.unit.get_container("zookeeper")
-        if not container.can_connect():
-            logger.debug("zookeeper container is not ready yet.")
-            event.defer()
-            return
-        try:
-            self._put_general_configs(container)
-        except (PathError, ProtocolError) as e:
-            logger.error("Cannot put configs: %r", e)
-            event.defer()
-            return
+        self._put_general_configs(event)
+        self._put_auth_configs(event)
 
         # Get a reference the container attribute on the PebbleReadyEvent
         container = event.workload
@@ -106,7 +98,8 @@ class ZooKeeperCharm(CharmBase):
         if "sync_password" not in self.app_data:
             self.app_data["sync_password"] = generate_password()
 
-    def _reconfigure(self, event) -> None:
+    # flake8: noqa: C901
+    def _reconfigure(self, event: HookEvent) -> None:
         """Reconfigure members.
 
         The amount members is updated.
@@ -114,36 +107,42 @@ class ZooKeeperCharm(CharmBase):
         if not self.unit.is_leader():
             return
 
-        # We generate passwords here, because “on_leader_elected“
-        # runs earlier than _on_zookeeper_pebble_ready event.
-        self._generate_passwords()
+        # During initial startup we need to provide passwords as soon as possible.
+        # Unfortunately password become available for other units only when the function finished.
+        if "sync_password" not in self.app_data:
+            self._generate_passwords()
+            return
 
         try:
-            with ZooKeeperConnection(self._zookeeper_config, "leader") as zk:
+            with ZooKeeperConnection(self.zookeeper_config, "leader") as zk:
                 zookeeper_members, _ = zk.get_members()
 
-                # compare (sets) members from /zookeeper/config and juju peer list
-                # to avoid the unnecessary reconfiguration.
-                if zookeeper_members == self._zookeeper_config.hosts:
-                    return
-
                 # remove members first, it is faster (no startup/initial sync delay)
-                logger.info("Reconfigure zookeeper members")
-                for member in zookeeper_members - self._zookeeper_config.hosts:
+                for member in zookeeper_members - self.zookeeper_config.hosts:
                     logger.debug("Removing %s", member)
                     zk.remove_member(member)
+                    # remove member from peer data to make `is_init_finished` works later.
                     self.app_data[member.split("=")[0]] = "removed"
 
-                # It is impossible to add a member with ID lower than the biggest ID between current members.
-                # Use “sorted” function to avoid issues.
-                for member in sorted(self._zookeeper_config.hosts - zookeeper_members):
-                    with ZooKeeperConnection(self._zookeeper_config, member) as direct_conn:
+                # It is impossible to add a member with ID lower than the biggest ID
+                # between current members. Use “sorted” function to avoid issues.
+                for member in sorted(self.zookeeper_config.hosts - zookeeper_members):
+                    logger.debug("Adding %s", member)
+                    if not self._is_my_turn(member):
+                        logger.info("Deferring adding: members should start sequentially.")
+                        event.defer()
+                        return
+                    with ZooKeeperConnection(self.zookeeper_config, member) as direct_conn:
                         if not direct_conn.is_ready:
                             logger.info("Deferring reconfigure: %s not ready", member)
                             event.defer()
-                    logger.debug("Adding %s", member)
+                            return
                     zk.add_member(member)
                     self.app_data[member.split("=")[0]] = "started"
+        except NotLeaderError:
+            logger.info("Deferring reconfigure: connection established to non-leader unit.")
+        except NotReadyError:
+            logger.info("Deferring reconfigure: sync in progress.")
         except (
             KazooTimeoutError,
             NoNodeError,
@@ -170,20 +169,20 @@ class ZooKeeperCharm(CharmBase):
                     "summary": "zookeeper",
                     "command": get_zookeeper_cmd(),
                     "startup": "enabled",
-                    "user": "zookeeper",
-                    "group": "zookeeper",
+                    "user": USER,
+                    "group": GROUP,
                 }
             },
         }
         return Layer(layer_config)
 
     @property
-    def app_data(self) -> Dict:
+    def app_data(self) -> Dict[str, str]:
         """Peer relation data object."""
         return self.model.get_relation(PEER).data[self.app]
 
     @property
-    def _zookeeper_config(self) -> ZooKeeperConfiguration:
+    def zookeeper_config(self) -> ZooKeeperConfiguration:
         """Create a configuration object with settings.
 
         Needed for correct handling interactions with MongoDB.
@@ -194,83 +193,128 @@ class ZooKeeperCharm(CharmBase):
         return ZooKeeperConfiguration(
             username="super",
             password=self.app_data.get("super_password"),
-            hosts=set(self._get_peer_units),
+            hosts=self._get_peer_units,
+            chroot="/",
+            roles={"cdrwa"},
         )
 
-    def _put_general_configs(self, container: Container) -> None:
+    def _put_auth_configs(self, event: HookEvent) -> None:
+        """Upload the Auth config to a workload container."""
+        container = self.unit.get_container("zookeeper")
+        if not container.can_connect():
+            logger.debug("zookeeper container is not ready yet.")
+            event.defer()
+            return
+
+        new_content = get_auth_config(
+            self.app_data.get("sync_password"),
+            self.app_data.get("super_password"),
+        )
+        old_content = None
+        try:
+            old_content = container.pull(AUTH_CONFIG_PATH).read()
+        except (PathError, ProtocolError):
+            pass
+
+        if new_content == old_content:
+            logger.debug("Restart not needed")
+            return
+
+        try:
+            container.push(
+                AUTH_CONFIG_PATH,
+                new_content,
+                make_dirs=True,
+                permissions=0o400,
+                user=USER,
+                group=GROUP,
+            )
+        except (PathError, ProtocolError) as e:
+            logger.error("Cannot put configs: %r", e)
+            event.defer()
+            return
+
+    def _put_general_configs(self, event: HookEvent) -> None:
         """Upload the configs to a workload container."""
-        myid = self._get_unit_id_by_unit(self.unit.name)
-        container.push(
-            DATA_DIR + "/myid",
-            str(myid),
-            make_dirs=True,
-            permissions=0o400,
-            user="zookeeper",
-            group="zookeeper",
-        )
-        container.push(
-            CONFIG_PATH,
-            get_main_config(),
-            make_dirs=True,
-            permissions=0o400,
-            user="zookeeper",
-            group="zookeeper",
-        )
-        container.push(
-            AUTH_CONFIG_PATH,
-            get_auth_config(
-                self.app_data.get("sync_password"), self.app_data.get("super_password")
-            ),
-            make_dirs=True,
-            permissions=0o400,
-            user="zookeeper",
-            group="zookeeper",
-        )
+        container = self.unit.get_container("zookeeper")
+        if not container.can_connect():
+            logger.debug("zookeeper container is not ready yet.")
+            event.defer()
+            return
+        try:
+            if not container.exists(DATA_DIR):
+                container.make_dir(
+                    DATA_DIR,
+                    make_parents=True,
+                    permissions=0o755,
+                    user=USER,
+                    group=GROUP,
+                )
+            if not container.exists(LOGS_DIR):
+                container.make_dir(
+                    LOGS_DIR,
+                    make_parents=True,
+                    permissions=0o755,
+                    user=USER,
+                    group=GROUP,
+                )
+            container.exec(("chown -R %s:%s /opt/kafka/config" % (USER, GROUP)).split(" "))
+            myid = self._get_unit_id_by_unit(self.unit.name)
+            container.push(
+                DATA_DIR + "/myid",
+                str(myid),
+                make_dirs=True,
+                permissions=0o400,
+                user=USER,
+                group=GROUP,
+            )
+            container.push(
+                CONFIG_PATH,
+                get_main_config(),
+                make_dirs=True,
+                permissions=0o400,
+                user=USER,
+                group=GROUP,
+            )
+            members = self._get_peer_units
+            # On just created the new/fresh cluster, new units should join as the “observer”
+            # before initial sync. Especially case when unit/0 adds unit/1 it is not clear
+            # for ZooKeeper, which member has the latest data.
+            if not self.is_init_finished:
+                members = self._get_init_units
+            container.push(
+                DYN_CONFIG_PATH,
+                "\n".join(members),
+                make_dirs=True,
+                permissions=0o400,
+                user=USER,
+                group=GROUP,
+            )
+        except (PathError, ProtocolError) as e:
+            logger.error("Cannot put configs: %r", e)
+            event.defer()
+            return
 
-        members = self._get_peer_units
-        # On just created the new/fresh cluster, new units should join as the “observer” before initial sync.
-        # Especially case when unit/0 adds unit/1 it is not clear for ZooKeeper, which member has the latest data.
-        if not self._is_init_finished:
-            members = self._get_init_units
-
-        container.push(
-            DYN_CONFIG_PATH,
-            "\n".join(members),
-            make_dirs=True,
-            permissions=0o400,
-            user="zookeeper",
-            group="zookeeper",
-        )
-
-    @property
-    def _is_my_turn(self) -> bool:
+    def _is_my_turn(self, member) -> bool:
         """Function guarantee start units started in order unit/0->unit/1->unit/2.
 
         Unfortunately, if ZooKeeper Server-Server auth configured, during the first
         cluster start (and horizontal scaling) it is needed to add members in order.
         """
-        myid = self._get_unit_id_by_unit(self.unit.name)
-        for unit_id in range(1, myid):
+        member_id = self._get_unit_id_by_server_str(member)
+        for unit_id in range(1, member_id):
             if self._get_unit_status(unit_id) != "started":
                 return False
         return True
 
     @property
-    def _is_init_finished(self) -> bool:
+    def is_init_finished(self) -> bool:
         """Function detect the unit restart.
 
         During initial start we should add members one by one, but during a single
         unit restart or failure, we should put all members into the config.
         """
-        myid = self._get_unit_id_by_unit(self.unit.name)
-        for unit in list(self.model.get_relation(PEER).units):
-            unit_id = self._get_unit_id_by_unit(unit.name)
-            if myid < unit_id:
-                continue
-            logger.debug("%s status: %s", unit.name, unit.status)
-
-        myid = self._get_unit_id_by_unit(self.unit.name)
-        for unit_id in range(1, myid + 1):
+        for unit_id in range(1, self.app.planned_units()):
             if self._get_unit_status(unit_id) != "started":
                 return False
         return True
@@ -282,25 +326,26 @@ class ZooKeeperCharm(CharmBase):
         return self.app_data[server_str]
 
     @property
-    def _get_peer_units(self) -> List:
+    def _get_peer_units(self) -> Set[str]:
         """Prepare ZooKeeper config with all cluster members."""
         result = []
         for unit in [self.unit] + list(self.model.get_relation(PEER).units):
             result.append(self._get_server_str(unit.name))
-        return result
+        return set(result)
 
     @property
-    def _get_init_units(self) -> List:
+    def _get_init_units(self) -> Set[str]:
         """Prepare *initial* ZooKeeper config with some members.
 
-        On just created the new/fresh cluster, new units should join as the “observer” before initial sync.
-        Especially case when unit/0 adds unit/1 it is not clear for ZooKeeper, which member has the latest data.
+        On just created the new/fresh cluster, new units should join as the “observer”
+        before initial sync. Especially case when unit/0 adds unit/1 it is not clear
+        for ZooKeeper, which member has the latest data.
         """
         quorum_leader = self.unit.name.split("/")[0] + "/0"
         result = [self._get_server_str(quorum_leader)]
         if self.unit.name != quorum_leader:
             result.append(self._get_server_str(self.unit.name, "observer"))
-        return result
+        return set(result)
 
     def _get_server_str(self, unit_name: str, role="participant") -> str:
         """Prepare member line for ZooKeeper config."""
@@ -312,6 +357,11 @@ class ZooKeeperCharm(CharmBase):
     def _get_unit_id_by_unit(unit_name: str) -> int:
         """Cut number from the unit name."""
         return int(unit_name.split("/")[1])
+
+    @staticmethod
+    def _get_unit_id_by_server_str(server_str: str) -> int:
+        """Cut number from the unit name."""
+        return int(server_str.split(".")[1].split("=")[0])
 
     def _get_hostname_by_unit(self, unit_name: str) -> str:
         """Create a DNS name for a unit.

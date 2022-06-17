@@ -20,6 +20,9 @@ CONFIG_PATH = "/conf/zookeeper.cfg"
 DYN_CONFIG_PATH = "/conf/zookeeper-dynamic.cfg"
 AUTH_CONFIG_PATH = "/conf/zookeeper-jaas.cfg"
 DATA_DIR = "/var/lib/zookeeper"
+LOGS_DIR = "/var/log/zookeeper"
+USER = "zookeeper"
+GROUP = "zookeeper"
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +35,29 @@ def get_zookeeper_cmd() -> str:
     """
     cmd = [
         "/usr/local/openjdk-11/bin/java",
-        "-cp '/apache-zookeeper-3.8.0-bin/lib/*:/conf:'",
-        "-Xmx1000m",
+        "-server -Djava.awt.headless=true",
+
+        "-Xmx512M -Xms512M",
         "-XX:+HeapDumpOnOutOfMemoryError",
         "-XX:OnOutOfMemoryError='kill -9 %p'",
+        "-XX:+UseG1GC",
+        "-XX:MaxGCPauseMillis=20",
+        "-XX:InitiatingHeapOccupancyPercent=35",
+        "-XX:+ExplicitGCInvokesConcurrent",
+        "-XX:MaxInlineLevel=15",
+        f"'-Xlog:gc*:file={LOGS_DIR}/zookeeper-gc.log:time,tags:filecount=10,filesize=100M'",
+
         "-Dcom.sun.management.jmxremote",
         "-Dcom.sun.management.jmxremote.local.only=true",
-        "-Dzookeeper.log.dir=/var/log",
+
+        f"-Dkafka.logs.dir={LOGS_DIR}",
         "-Dzookeeper.log.file=zookeeper.log",
-        "-Dzookeeper.requireClientAuthScheme=sasl",
-        "-Dzookeeper.superUser.1=super",
+
         f"-Djava.security.auth.login.config={AUTH_CONFIG_PATH}",
+        "-Dzookeeper.requireClientAuthScheme=sasl",
+        "-Dzookeeper.superUser=super",
+
+        "-cp './lib/*:/conf:'",
         "org.apache.zookeeper.server.quorum.QuorumPeerMain",
         CONFIG_PATH,
     ]
@@ -76,31 +91,27 @@ def get_main_config() -> str:
         quorum.auth.enableSasl=true
         quorum.auth.learnerRequireSasl=true
         quorum.auth.serverRequireSasl=true
+        authProvider.sasl=org.apache.zookeeper.server.auth.SASLAuthenticationProvider
+        audit.enable=true
     """
 
 
 def get_auth_config(sync_password, super_password: str) -> str:
     """Generate content of the auth ZooKeeper config file"""
     return f"""
-        Server {{
-            org.apache.zookeeper.server.auth.DigestLoginModule required
-            user_super="{super_password}";
-        }};
-
-        Client {{
-            org.apache.zookeeper.server.auth.DigestLoginModule required
-            username="super"
-            password="{super_password}";
-        }};
-
         QuorumServer {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
-            user_cluster="{sync_password}";
+            user_sync="{sync_password}";
         }};
 
         QuorumLearner {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
-            username="cluster"
+            username="sync"
             password="{sync_password}";
+        }};
+        
+        Server {{
+            org.apache.zookeeper.server.auth.DigestLoginModule required
+            user_super="{super_password}";
         }};
     """
