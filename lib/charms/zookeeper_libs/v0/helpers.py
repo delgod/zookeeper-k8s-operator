@@ -6,6 +6,9 @@ import string
 import secrets
 import logging
 
+from typing import Set
+from charms.zookeeper_libs.v0.zookeeper import ZooKeeperConfiguration
+
 # The unique Charmhub library identifier, never change it
 LIBID = "1057f353503741a98ed79309b5be7f31"
 
@@ -96,9 +99,14 @@ def get_main_config() -> str:
     """
 
 
-def get_auth_config(sync_password, super_password: str) -> str:
+def get_auth_config(sync_password, super_password: str, configs: Set[ZooKeeperConfiguration]) -> str:
     """Generate content of the auth ZooKeeper config file"""
-    return f"""
+    users = "\n".join([
+        f"user_{config.username}=\"{config.password}\""
+        for config in configs
+        if config.password is not None
+    ])
+    result = f"""
         QuorumServer {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
             user_sync="{sync_password}";
@@ -112,6 +120,8 @@ def get_auth_config(sync_password, super_password: str) -> str:
         
         Server {{
             org.apache.zookeeper.server.auth.DigestLoginModule required
+            {users}
             user_super="{super_password}";
         }};
     """
+    return result
