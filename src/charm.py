@@ -20,9 +20,9 @@ from charms.zookeeper_libs.v0.helpers import (
     CONFIG_PATH,
     DATA_DIR,
     DYN_CONFIG_PATH,
-    GROUP,
     LOGS_DIR,
-    USER,
+    UNIX_GROUP,
+    UNIX_USER,
     generate_password,
     get_auth_config,
     get_main_config,
@@ -175,8 +175,8 @@ class ZooKeeperCharm(CharmBase):
                     "summary": "zookeeper",
                     "command": get_zookeeper_cmd(),
                     "startup": "enabled",
-                    "user": USER,
-                    "group": GROUP,
+                    "user": UNIX_USER,
+                    "group": UNIX_GROUP,
                 }
             },
         }
@@ -233,8 +233,8 @@ class ZooKeeperCharm(CharmBase):
                 new_content,
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
         except (PathError, ProtocolError) as e:
             logger.error("Cannot put configs: %r", e)
@@ -280,34 +280,33 @@ class ZooKeeperCharm(CharmBase):
                     DATA_DIR,
                     make_parents=True,
                     permissions=0o755,
-                    user=USER,
-                    group=GROUP,
+                    user=UNIX_USER,
+                    group=UNIX_GROUP,
                 )
             if not container.exists(LOGS_DIR):
                 container.make_dir(
                     LOGS_DIR,
                     make_parents=True,
                     permissions=0o755,
-                    user=USER,
-                    group=GROUP,
+                    user=UNIX_USER,
+                    group=UNIX_GROUP,
                 )
-            container.exec(("chown -R %s:%s /opt/kafka/config" % (USER, GROUP)).split(" "))
             myid = self._get_unit_id_by_unit(self.unit.name)
             container.push(
                 DATA_DIR + "/myid",
                 str(myid),
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
             container.push(
                 CONFIG_PATH,
                 get_main_config(),
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
             members = self._get_peer_units
             # On just created the new/fresh cluster, new units should join as the “observer”
@@ -320,8 +319,8 @@ class ZooKeeperCharm(CharmBase):
                 "\n".join(members),
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
         except (PathError, ProtocolError) as e:
             logger.error("Cannot put configs: %r", e)
@@ -400,7 +399,7 @@ class ZooKeeperCharm(CharmBase):
         """Create a DNS name for a unit.
 
         Args:
-            unit_name: the juju unit name, e.g. "mongodb/1".
+            unit_name: the juju unit name, e.g. "zookeeper-k8s/1".
 
         Returns:
             A string representing the hostname of the unit.

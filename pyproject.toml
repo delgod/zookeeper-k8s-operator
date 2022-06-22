@@ -2,7 +2,7 @@
 # See LICENSE file for licensing details.
 
 [tool.poetry]
-name = "mongodb"
+name = "zookeeper-k8s"
 version = "0.0.1-dev.0"
 description = ""
 authors = [
@@ -17,7 +17,7 @@ homepage = "TODO"
 repository = "TODO"
 
 [tool.poetry.dependencies]
-python = "^3.8"
+python = "^3.9"
 
 ops = "^1.2"
 tenacity = "^8.0.1"

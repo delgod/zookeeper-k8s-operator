@@ -231,31 +231,23 @@ class ZooKeeperProvider(Object):
 
     def _get_chroot_from_relation(self, relation: Relation) -> Optional[str]:
         """Return chroot name from relation."""
-        for unit in relation.units:
-            if unit.app is self.charm.app:
-                # it is peer relation, skip
-                continue
-            chroot = relation.data[unit].get("chroot", None)
-            if chroot is None:
-                chroot = relation.data[unit].get("database", None)
-            if chroot is not None:
-                if not str(chroot).startswith("/"):
-                    chroot = f"/{chroot}"
-                return chroot
+        chroot = relation.data[relation.app].get("chroot", None)
+        if chroot is None:
+            chroot = relation.data[relation.app].get("database", None)
+        if chroot is not None:
+            if not str(chroot).startswith("/"):
+                chroot = f"/{chroot}"
+            return chroot
         return None
 
     def _get_roles_from_relation(self, relation: Relation) -> Set[str]:
         """Return user roles from relation if specified or return default."""
-        for unit in relation.units:
-            if unit.app is self.charm.app:
-                # it is peer relation, skip
-                continue
-            roles = relation.data[unit].get("user-role", None)
-            if roles is not None:
-                return set(roles.split(","))
-            roles = relation.data[unit].get("extra-user-roles", None)
-            if roles is not None:
-                return set(roles.split(","))
+        roles = relation.data[relation.app].get("user-role", None)
+        if roles is not None:
+            return set(roles.split(","))
+        roles = relation.data[relation.app].get("extra-user-roles", None)
+        if roles is not None:
+            return set(roles.split(","))
         return {"cdrwa"}
 
     def _get_password_from_relation_id(self, relation_id: int) -> Optional[str]:

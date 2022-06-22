@@ -24,8 +24,8 @@ DYN_CONFIG_PATH = "/conf/zookeeper-dynamic.cfg"
 AUTH_CONFIG_PATH = "/conf/zookeeper-jaas.cfg"
 DATA_DIR = "/var/lib/zookeeper"
 LOGS_DIR = "/var/log/zookeeper"
-USER = "zookeeper"
-GROUP = "zookeeper"
+UNIX_USER = "zookeeper"
+UNIX_GROUP = "zookeeper"
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ def get_zookeeper_cmd() -> str:
         "-Dcom.sun.management.jmxremote",
         "-Dcom.sun.management.jmxremote.local.only=true",
 
-        f"-Dkafka.logs.dir={LOGS_DIR}",
+        f"-Dzookeeper.log.dir={LOGS_DIR}",
         "-Dzookeeper.log.file=zookeeper.log",
 
         f"-Djava.security.auth.login.config={AUTH_CONFIG_PATH}",
