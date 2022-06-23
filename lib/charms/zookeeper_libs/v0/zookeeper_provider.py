@@ -68,9 +68,10 @@ class ZooKeeperProvider(Object):
         departed_relation_id = None
         if type(event) is RelationBrokenEvent:
             departed_relation_id = event.relation.id
-            username = self._get_username_from_relation_id(departed_relation_id)
-            if username in self.charm.app_data:
-                self.charm.app_data[username] = None
+            if self.charm.unit.is_leader():
+                username = self._get_username_from_relation_id(departed_relation_id)
+                if username in self.charm.app_data:
+                    del self.charm.app_data[username]
 
         # We shouldn't try to create or update users if the database is not
         # initialised. We will create users as part of initialisation.
@@ -180,7 +181,7 @@ class ZooKeeperProvider(Object):
         relation.data[self.charm.app]["uris"] = config.uri
         relation.data[self.charm.app]["endpoints"] = ",".join([
             config.parse_host_port(host)
-            for host in config.hosts
+            for host in sorted(config.hosts)
         ])
 
     @staticmethod
@@ -229,7 +230,8 @@ class ZooKeeperProvider(Object):
         relation_id = int(match.group(1))
         return self.model.get_relation(REL_NAME, relation_id)
 
-    def _get_chroot_from_relation(self, relation: Relation) -> Optional[str]:
+    @staticmethod
+    def _get_chroot_from_relation(relation: Relation) -> Optional[str]:
         """Return chroot name from relation."""
         chroot = relation.data[relation.app].get("chroot", None)
         if chroot is None:
@@ -240,7 +242,8 @@ class ZooKeeperProvider(Object):
             return chroot
         return None
 
-    def _get_roles_from_relation(self, relation: Relation) -> Set[str]:
+    @staticmethod
+    def _get_roles_from_relation(relation: Relation) -> Set[str]:
         """Return user roles from relation if specified or return default."""
         roles = relation.data[relation.app].get("user-role", None)
         if roles is not None:
