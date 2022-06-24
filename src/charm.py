@@ -201,7 +201,7 @@ class ZooKeeperCharm(CharmBase):
             password=self.app_data.get("super_password"),
             hosts=self._get_peer_units,
             chroot="/",
-            roles={"cdrwa"},
+            acl="cdrwa",
         )
 
     def _put_auth_configs(self, event: HookEvent) -> None:

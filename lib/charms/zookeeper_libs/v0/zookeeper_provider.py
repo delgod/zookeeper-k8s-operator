@@ -163,7 +163,7 @@ class ZooKeeperProvider(Object):
             username=self._get_username_from_relation_id(relation.id),
             password=self._get_password_from_relation_id(relation.id),
             hosts=self.charm.zookeeper_config.hosts,
-            roles=self._get_roles_from_relation(relation),
+            acl=self._get_acl_from_relation(relation),
         )
 
     def _set_relation(self, config: ZooKeeperConfiguration) -> None:
@@ -243,15 +243,12 @@ class ZooKeeperProvider(Object):
         return None
 
     @staticmethod
-    def _get_roles_from_relation(relation: Relation) -> Set[str]:
-        """Return user roles from relation if specified or return default."""
-        roles = relation.data[relation.app].get("user-role", None)
-        if roles is not None:
-            return set(roles.split(","))
-        roles = relation.data[relation.app].get("extra-user-roles", None)
-        if roles is not None:
-            return set(roles.split(","))
-        return {"cdrwa"}
+    def _get_acl_from_relation(relation: Relation) -> str:
+        """Return user acl from relation if specified or return default."""
+        acl = relation.data[relation.app].get("chroot-acl", None)
+        if acl is not None:
+            return acl
+        return "cdrwa"
 
     def _get_password_from_relation_id(self, relation_id: int) -> Optional[str]:
         """Return password from relation if specified or return None."""
@@ -275,11 +272,11 @@ class ZooKeeperProvider(Object):
         return make_acl(
             "sasl",
             config.username,
-            read='r' in config.roles,
-            write='w' in config.roles,
-            create='c' in config.roles,
-            delete='d' in config.roles,
-            admin='a' in config.roles,
+            read='r' in config.acl,
+            write='w' in config.acl,
+            create='c' in config.acl,
+            delete='d' in config.acl,
+            admin='a' in config.acl,
         )
 
     @staticmethod

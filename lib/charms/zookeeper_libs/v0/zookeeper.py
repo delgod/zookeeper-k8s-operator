@@ -40,7 +40,7 @@ class ZooKeeperConfiguration:
     username: str
     password: Optional[str]
     hosts: Set[str]
-    roles: Set[str]
+    acl: str
 
     def __hash__(self):
         return hash(f"{self.username}:{self.password}@{self.uri}")
