@@ -14,14 +14,15 @@ includes scaling and other capabilities.
 import logging
 from typing import Dict, Set
 
+from charms.rolling_ops.v0.rollingops import RollingOpsManager
 from charms.zookeeper_libs.v0.helpers import (
     AUTH_CONFIG_PATH,
     CONFIG_PATH,
     DATA_DIR,
     DYN_CONFIG_PATH,
-    GROUP,
     LOGS_DIR,
-    USER,
+    UNIX_GROUP,
+    UNIX_USER,
     generate_password,
     get_auth_config,
     get_main_config,
@@ -33,6 +34,7 @@ from charms.zookeeper_libs.v0.zookeeper import (
     ZooKeeperConfiguration,
     ZooKeeperConnection,
 )
+from charms.zookeeper_libs.v0.zookeeper_provider import ZooKeeperProvider
 from kazoo.exceptions import (
     BadArgumentsError,
     BadVersionError,
@@ -63,6 +65,10 @@ class ZooKeeperCharm(CharmBase):
         self.framework.observe(self.on.leader_elected, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_changed, self._reconfigure)
         self.framework.observe(self.on[PEER].relation_departed, self._reconfigure)
+        self.client_relations = ZooKeeperProvider(self)
+        self.restart_manager = RollingOpsManager(
+            charm=self, relation="restart", callback=self._put_auth_configs
+        )
 
     def _on_zookeeper_pebble_ready(self, event: PebbleReadyEvent) -> None:
         """Configure pebble layer specification."""
@@ -169,8 +175,8 @@ class ZooKeeperCharm(CharmBase):
                     "summary": "zookeeper",
                     "command": get_zookeeper_cmd(),
                     "startup": "enabled",
-                    "user": USER,
-                    "group": GROUP,
+                    "user": UNIX_USER,
+                    "group": UNIX_GROUP,
                 }
             },
         }
@@ -195,7 +201,7 @@ class ZooKeeperCharm(CharmBase):
             password=self.app_data.get("super_password"),
             hosts=self._get_peer_units,
             chroot="/",
-            roles={"cdrwa"},
+            acl="cdrwa",
         )
 
     def _put_auth_configs(self, event: HookEvent) -> None:
@@ -209,6 +215,7 @@ class ZooKeeperCharm(CharmBase):
         new_content = get_auth_config(
             self.app_data.get("sync_password"),
             self.app_data.get("super_password"),
+            self.client_relations.get_configs_from_relations(),
         )
         old_content = None
         try:
@@ -226,13 +233,39 @@ class ZooKeeperCharm(CharmBase):
                 new_content,
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
         except (PathError, ProtocolError) as e:
             logger.error("Cannot put configs: %r", e)
             event.defer()
             return
+
+        if not container.get_services("zookeeper"):
+            return
+
+        # Make sure ZooKeeper is up and joined quorum
+        leader = self.zookeeper_config.fetch_leader(self._get_hostname_by_unit(self.unit.name))
+        if leader is None:
+            logger.debug("Deferring restart: ZooKeeper not joined quorum.")
+            event.defer()
+            return
+
+        # Apply auth changes
+        logger.debug("Restarting ZooKeeper.")
+        container.restart("zookeeper")
+
+        # Let's try to wait successful restart
+        try:
+            for attempt in Retrying(stop=stop_after_delay(60), wait=wait_fixed(3)):
+                with attempt:
+                    leader = self.zookeeper_config.fetch_leader(
+                        self._get_hostname_by_unit(self.app.name)
+                    )
+                    if leader is None:
+                        raise Exception("Retrying: ZooKeeper not joined quorum.")
+        except RetryError:
+            logger.warning("ZooKeeper haven't joined quorum.")
 
     def _put_general_configs(self, event: HookEvent) -> None:
         """Upload the configs to a workload container."""
@@ -247,34 +280,33 @@ class ZooKeeperCharm(CharmBase):
                     DATA_DIR,
                     make_parents=True,
                     permissions=0o755,
-                    user=USER,
-                    group=GROUP,
+                    user=UNIX_USER,
+                    group=UNIX_GROUP,
                 )
             if not container.exists(LOGS_DIR):
                 container.make_dir(
                     LOGS_DIR,
                     make_parents=True,
                     permissions=0o755,
-                    user=USER,
-                    group=GROUP,
+                    user=UNIX_USER,
+                    group=UNIX_GROUP,
                 )
-            container.exec(("chown -R %s:%s /opt/kafka/config" % (USER, GROUP)).split(" "))
             myid = self._get_unit_id_by_unit(self.unit.name)
             container.push(
                 DATA_DIR + "/myid",
                 str(myid),
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
             container.push(
                 CONFIG_PATH,
                 get_main_config(),
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
             members = self._get_peer_units
             # On just created the new/fresh cluster, new units should join as the “observer”
@@ -287,8 +319,8 @@ class ZooKeeperCharm(CharmBase):
                 "\n".join(members),
                 make_dirs=True,
                 permissions=0o400,
-                user=USER,
-                group=GROUP,
+                user=UNIX_USER,
+                group=UNIX_GROUP,
             )
         except (PathError, ProtocolError) as e:
             logger.error("Cannot put configs: %r", e)
@@ -367,7 +399,7 @@ class ZooKeeperCharm(CharmBase):
         """Create a DNS name for a unit.
 
         Args:
-            unit_name: the juju unit name, e.g. "mongodb/1".
+            unit_name: the juju unit name, e.g. "zookeeper-k8s/1".
 
         Returns:
             A string representing the hostname of the unit.

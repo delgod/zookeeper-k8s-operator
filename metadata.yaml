@@ -11,6 +11,8 @@ summary: A ZooKeeper operator charm for Kubernetes
 peers:
   database-peers:
     interface: zookeeper-peers
+  restart:
+    interface: rolling_op
 provides:
   database:
     interface: zookeeper-client

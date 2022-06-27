@@ -9,8 +9,9 @@ from urllib.request import urlopen
 from urllib.error import URLError
 from dataclasses import dataclass
 from kazoo.client import KazooClient
+from kazoo.security import ACL
 from kazoo.exceptions import KazooException
-from typing import Set, Dict, Optional
+from typing import Set, Dict, List, Optional
 
 # The unique Charmhub library identifier, never change it
 LIBID = "1057f353503741a98ed79309b5be7f30"
@@ -39,7 +40,7 @@ class ZooKeeperConfiguration:
     username: str
     password: Optional[str]
     hosts: Set[str]
-    roles: Set[str]
+    acl: str
 
     def __hash__(self):
         return hash(f"{self.username}:{self.password}@{self.uri}")
@@ -264,3 +265,33 @@ class ZooKeeperConnection:
             for element in zk_response.split("\n")
             if "\t" in element
         )
+
+    def get_paths(self, path: str) -> Set[str]:
+        """Return list of all non-default paths."""
+        children = self.client.get_children(path)
+        result = set()
+        for child in children:
+            if path + child != "/zookeeper":
+                result.update(self.get_paths(path.rstrip("/") + "/" + child))
+        if path != "/":
+            result.add(path)
+        return result
+
+    def drop_path(self, path: str) -> None:
+        """Return list of all non-default paths."""
+        if not self.client.exists(path):
+            return
+        self.client.delete(path, recursive=True)
+
+    def create_path(self, path, acls: List[ACL]) -> None:
+        """Return list of all non-default paths."""
+        self.client.create(path, acl=acls, makepath=True)
+
+    def get_acls(self, path: str) -> List[ACL]:
+        """Return list of all ACLs for the path."""
+        acl_list, _ = self.client.get_acls(path)
+        return acl_list
+
+    def set_acls(self, path: str, acls: List[ACL]) -> None:
+        """Set ACLs for the path."""
+        self.client.set_acls(path, list(acls))
